@@ -13,13 +13,13 @@ use serde_json::{Map, Value};
 
 use crate::paths::AppPaths;
 use crate::process;
-use crate::state::{self, Profile, StateLock};
+use crate::state::{self, Profile, ProfileReservation, StateLock};
 
 #[derive(Debug, Parser)]
 #[command(
     name = "claude account",
     version,
-    about = "Manage isolated Claude Code accounts on Linux"
+    about = "Manage isolated Claude Code accounts across Linux and macOS"
 )]
 pub struct AccountCli {
     #[command(subcommand)]
@@ -48,6 +48,11 @@ enum AccountCommand {
     List,
     /// Print only the active profile name
     Current,
+    /// Safely unregister one exact name from legacy case-colliding state
+    ResolveCaseCollision {
+        /// Exact profile name to unregister
+        name: String,
+    },
     /// Log out and unregister a profile
     Remove {
         name: String,
@@ -81,6 +86,7 @@ impl AccountCli {
             AccountCommand::Use { name } => use_profile(paths, &name),
             AccountCommand::List => list(paths),
             AccountCommand::Current => current(paths),
+            AccountCommand::ResolveCaseCollision { name } => resolve_case_collision(paths, &name),
             AccountCommand::Remove {
                 name,
                 purge,
@@ -94,21 +100,21 @@ impl AccountCli {
 
 fn add(paths: &AppPaths, name: &str, email: Option<&str>, sso: bool, console: bool) -> Result<()> {
     validate_profile_name(name)?;
+    let _profile_reservation = ProfileReservation::acquire(paths, name)?;
     let current_executable = env::current_exe().context("failed to locate this executable")?;
-    let existing_state = {
-        let _lock = StateLock::acquire(paths)?;
+    let initial_real_claude = {
+        let _state_lock = StateLock::acquire(paths)?;
         let state = state::load(paths)?;
         if state.profiles.contains_key(name) {
             bail!("profile `{name}` already exists");
         }
-        state
+        validate_new_profile_name(&state, name)?;
+        state.real_claude.clone()
     };
 
-    let real_claude = process::resolve_real_claude(
-        existing_state.real_claude.as_deref(),
-        &current_executable,
-        paths,
-    )?;
+    let real_claude =
+        process::resolve_real_claude(initial_real_claude.as_deref(), &current_executable, paths)?;
+    process::validate_platform_support(&real_claude)?;
     let profile_dir = paths.profile_dir(name);
     state::ensure_private_dir(&profile_dir)?;
 
@@ -150,13 +156,17 @@ fn add(paths: &AppPaths, name: &str, email: Option<&str>, sso: bool, console: bo
 
     let first_profile;
     {
-        let _lock = StateLock::acquire(paths)?;
+        let _state_lock = StateLock::acquire(paths)?;
         let mut state = state::load(paths)?;
         if state.profiles.contains_key(name) {
             bail!("profile `{name}` was added by another process");
         }
+        validate_new_profile_name(&state, name)?;
+
         first_profile = state.profiles.is_empty();
-        state.real_claude = Some(real_claude);
+        if state.real_claude == initial_real_claude {
+            state.real_claude = Some(real_claude);
+        }
         state
             .profiles
             .insert(name.to_owned(), Profile::new(profile_dir));
@@ -228,6 +238,7 @@ fn complete_claude_onboarding(profile_dir: &Path) -> Result<()> {
 
 fn use_profile(paths: &AppPaths, name: &str) -> Result<()> {
     validate_profile_name(name)?;
+    let _profile_reservation = ProfileReservation::acquire(paths, name)?;
     let _lock = StateLock::acquire(paths)?;
     let mut state = state::load(paths)?;
     if !state.profiles.contains_key(name) {
@@ -267,9 +278,76 @@ fn current(paths: &AppPaths) -> Result<()> {
     }
 }
 
-fn remove(paths: &AppPaths, name: &str, purge: bool, force: bool) -> Result<()> {
+fn resolve_case_collision(paths: &AppPaths, name: &str) -> Result<()> {
     validate_profile_name(name)?;
-    let (profile, real_claude, is_active) = {
+    let _profile_reservation = ProfileReservation::acquire(paths, name)?;
+    let _lock = StateLock::acquire(paths)?;
+    let mut state = state::load_for_case_collision_resolution(paths)?;
+    let profile = state
+        .profiles
+        .get(name)
+        .cloned()
+        .with_context(|| format!("profile `{name}` does not exist"))?;
+    state
+        .case_colliding_profile_name(name)
+        .with_context(|| format!("profile `{name}` does not have a case-colliding sibling"))?;
+
+    state.profiles.remove(name);
+    let removed_was_active = state.active.as_deref() == Some(name);
+    if removed_was_active {
+        state.active = None;
+    }
+    let remaining_case_variants: Vec<String> = state
+        .profiles
+        .keys()
+        .filter(|existing| existing.eq_ignore_ascii_case(name))
+        .cloned()
+        .collect();
+    state::save(paths, &state)?;
+
+    println!("Unregistered exact profile name `{name}` from account state.");
+    println!(
+        "Local data and credentials were preserved; Claude logout was not run and {} was not deleted.",
+        profile.config_dir.display()
+    );
+    if let [survivor] = remaining_case_variants.as_slice() {
+        println!("`{survivor}` remains registered.");
+        if removed_was_active {
+            println!(
+                "Finish recovery with `claude account use {survivor}` if it should be active."
+            );
+        } else if state.active.as_deref() == Some(survivor.as_str()) {
+            println!("`{survivor}` remains active; normal commands can resume.");
+        } else {
+            println!(
+                "Normal commands can resume. Run `claude account use {survivor}` to activate the surviving profile."
+            );
+        }
+    } else {
+        let next = &remaining_case_variants[0];
+        println!(
+            "Case-colliding profiles still remain. Run `claude account resolve-case-collision {next}` again, leaving exactly one spelling registered."
+        );
+    }
+    Ok(())
+}
+
+fn remove(paths: &AppPaths, name: &str, purge: bool, force: bool) -> Result<()> {
+    remove_with_purge(paths, name, purge, force, |path| {
+        fs::remove_dir_all(path).with_context(|| format!("failed to purge {}", path.display()))
+    })
+}
+
+fn remove_with_purge(
+    paths: &AppPaths,
+    name: &str,
+    purge: bool,
+    force: bool,
+    purge_directory: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
+    validate_profile_name(name)?;
+    let _profile_reservation = ProfileReservation::acquire(paths, name)?;
+    let (profile, real_claude) = {
         let _lock = StateLock::acquire(paths)?;
         let state = state::load(paths)?;
         let profile = state
@@ -287,9 +365,10 @@ fn remove(paths: &AppPaths, name: &str, purge: bool, force: bool) -> Result<()> 
                 "`{name}` is active; switch profiles first, or pass --force to leave no active profile"
             );
         }
-        (profile, real_claude, is_active)
+        (profile, real_claude)
     };
 
+    process::validate_platform_support(&real_claude)?;
     println!("Logging out profile `{name}`...");
     let logout_status = process::managed_command(&real_claude, &profile.config_dir)
         .args(["auth", "logout"])
@@ -303,7 +382,7 @@ fn remove(paths: &AppPaths, name: &str, purge: bool, force: bool) -> Result<()> 
         let _lock = StateLock::acquire(paths)?;
         let mut state = state::load(paths)?;
         state.profiles.remove(name);
-        if is_active && state.active.as_deref() == Some(name) {
+        if state.active.as_deref() == Some(name) {
             state.active = None;
         }
         state::save(paths, &state)?;
@@ -323,8 +402,7 @@ fn remove(paths: &AppPaths, name: &str, purge: bool, force: bool) -> Result<()> 
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             bail!("refusing to purge a symlink or non-directory");
         }
-        fs::remove_dir_all(&expected)
-            .with_context(|| format!("failed to purge {}", expected.display()))?;
+        purge_directory(&expected)?;
         println!("Removed `{name}` and permanently deleted its local data.");
     } else {
         println!(
@@ -351,6 +429,7 @@ fn install(paths: &AppPaths, explicit_real: Option<&Path>) -> Result<()> {
         }
         None => process::resolve_real_claude(configured.as_deref(), &current_executable, paths)?,
     };
+    process::validate_platform_support(&real_claude)?;
 
     state::ensure_private_dir(&paths.data_dir)?;
     state::ensure_private_dir(&paths.shim_dir)?;
@@ -414,8 +493,24 @@ fn install(paths: &AppPaths, explicit_real: Option<&Path>) -> Result<()> {
     println!("Real Claude: {}", real_claude.display());
     println!("Shim: {}", paths.shim.display());
     println!();
-    println!("Add this line to ~/.bashrc, then open a new terminal:");
+    println!(
+        "Add this line to your shell startup file (for example, ~/.zshrc or ~/.bashrc), then open a new terminal:"
+    );
     println!("export PATH=\"{}:$PATH\"", paths.shim_dir.display());
+    Ok(())
+}
+
+fn validate_new_profile_name(state: &state::State, name: &str) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    if let Some(existing) = state.case_colliding_profile_name(name) {
+        bail!(
+            "profile `{name}` differs only by letter case from existing profile `{existing}`; choose another name on macOS"
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    let _ = (state, name);
+
     Ok(())
 }
 
@@ -439,6 +534,18 @@ fn validate_profile_name(name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    use std::os::fd::AsRawFd;
+
+    #[cfg(target_os = "macos")]
+    const LOCK_EX: i32 = 2;
+    #[cfg(target_os = "macos")]
+    const LOCK_NB: i32 = 4;
+
+    #[cfg(target_os = "macos")]
+    unsafe extern "C" {
+        fn flock(fd: i32, operation: i32) -> i32;
+    }
 
     #[test]
     fn profile_name_validation_blocks_path_traversal() {
@@ -460,6 +567,10 @@ mod tests {
         writeln!(
             script,
             "#!/bin/sh\n\
+             if [ \"$1\" = \"--version\" ]; then\n\
+               printf '2.1.144 (Claude Code)\\n'\n\
+               exit 0\n\
+             fi\n\
              printf '%s|%s\\n' \"$CLAUDE_CONFIG_DIR\" \"$*\" >> '{}'\n\
              if [ \"$1 $2 $3\" = \"auth status --json\" ]; then\n\
                printf '{{\"loggedIn\":true}}\\n'\n\
@@ -522,6 +633,10 @@ mod tests {
         fs::write(
             &fake_claude,
             "#!/bin/sh\n\
+             if [ \"$1\" = \"--version\" ]; then\n\
+               printf '2.1.144 (Claude Code)\\n'\n\
+               exit 0\n\
+             fi\n\
              if [ \"$1 $2 $3\" = \"auth status --json\" ]; then\n\
                printf '{\"loggedIn\":false}\\n'\n\
              fi\n\
@@ -541,5 +656,110 @@ mod tests {
         assert!(error.to_string().contains("did not report a valid login"));
         assert!(!state::load(&paths).unwrap().profiles.contains_key("work"));
         assert!(!paths.profile_dir("work").join(".claude.json").exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn add_rejects_profile_name_that_differs_only_by_case() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_roots(temp.path().join("config"), temp.path().join("data"));
+        let fake_claude = temp.path().join("claude-real");
+        fs::write(
+            &fake_claude,
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"--version\" ]; then\n\
+               printf '2.1.144 (Claude Code)\\n'\n\
+               exit 0\n\
+             fi\n\
+             if [ \"$1 $2 $3\" = \"auth status --json\" ]; then\n\
+               printf '{\"loggedIn\":true}\\n'\n\
+             fi\n\
+             exit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake_claude, fs::Permissions::from_mode(0o755)).unwrap();
+
+        {
+            let _lock = StateLock::acquire(&paths).unwrap();
+            let mut initial = state::load(&paths).unwrap();
+            initial.real_claude = Some(fake_claude);
+            initial
+                .profiles
+                .insert("Work".to_owned(), Profile::new(paths.profile_dir("Work")));
+            initial.active = Some("Work".to_owned());
+            state::save(&paths, &initial).unwrap();
+        }
+
+        let error = add(&paths, "work", None, false, false).unwrap_err();
+        assert!(error.to_string().contains("differs only by letter case"));
+        assert_eq!(state::load(&paths).unwrap().profiles.len(), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn remove_holds_profile_reservation_during_purge() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_roots(temp.path().join("config"), temp.path().join("data"));
+        let fake_claude = temp.path().join("claude-real");
+        fs::write(
+            &fake_claude,
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"--version\" ]; then\n\
+               printf '2.1.144 (Claude Code)\\n'\n\
+             fi\n\
+             exit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake_claude, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let profile_dir = paths.profile_dir("Work");
+        state::ensure_private_dir(&profile_dir).unwrap();
+        fs::write(profile_dir.join("old-data"), b"remove me\n").unwrap();
+        {
+            let _lock = StateLock::acquire(&paths).unwrap();
+            let mut initial = state::load(&paths).unwrap();
+            initial.real_claude = Some(fake_claude);
+            initial
+                .profiles
+                .insert("Work".to_owned(), Profile::new(profile_dir.clone()));
+            initial.active = Some("Work".to_owned());
+            state::save(&paths, &initial).unwrap();
+        }
+
+        let reservation_path = paths.profile_reservations_dir.join("work.lock");
+        let mut observed_purge = false;
+        remove_with_purge(&paths, "Work", true, true, |purge_path| {
+            observed_purge = true;
+            assert_eq!(purge_path, profile_dir);
+            assert!(!state::load(&paths).unwrap().profiles.contains_key("Work"));
+
+            let reservation = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&reservation_path)
+                .unwrap();
+            let result = unsafe { flock(reservation.as_raw_fd(), LOCK_EX | LOCK_NB) };
+            assert_eq!(result, -1, "profile reservation was released before purge");
+            assert_eq!(
+                std::io::Error::last_os_error().kind(),
+                ErrorKind::WouldBlock
+            );
+
+            fs::remove_dir_all(purge_path)?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(observed_purge);
+
+        let reservation = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(reservation_path)
+            .unwrap();
+        assert_eq!(
+            unsafe { flock(reservation.as_raw_fd(), LOCK_EX | LOCK_NB) },
+            0,
+            "profile reservation remained locked after remove returned"
+        );
     }
 }

@@ -14,9 +14,11 @@ Thank you for helping improve claude-account.
 
 Requirements:
 
-- Linux
+- Linux or macOS
 - Rust 1.85 or newer
-- Claude Code only when manually testing real authentication
+- Xcode Command Line Tools when building on macOS
+- Claude Code only when manually testing real authentication; version 2.1.144
+  or newer is required on macOS
 
 Run the local checks:
 
@@ -28,6 +30,10 @@ cargo clippy --locked --all-targets -- -D warnings
 
 The automated tests use temporary directories and a fake Claude executable.
 They must not read or modify the developer's real `~/.claude` directory.
+
+Changes to macOS authentication, secure storage, profile paths, or migration
+must also be tested with two real accounts on a Mac before release. Never use
+real credentials in automated tests, logs, issues, or pull requests.
 
 ## Pull requests
 
