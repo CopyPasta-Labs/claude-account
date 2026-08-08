@@ -16,19 +16,21 @@ pub struct AppPaths {
     pub shim_dir: PathBuf,
     pub shim: PathBuf,
     pub installed_executable: PathBuf,
+    pub default_claude_dir: PathBuf,
+    pub default_claude_json: PathBuf,
 }
 
 impl AppPaths {
     pub fn discover() -> Result<Self> {
-        if let Some(root) = env::var_os("CLAUDE_ACCOUNT_HOME") {
-            let root = absolute_path(root, "CLAUDE_ACCOUNT_HOME")?;
-            return Ok(Self::from_roots(root.clone(), root));
-        }
-
         let home = env::var_os("HOME")
             .map(PathBuf::from)
             .filter(|path| path.is_absolute())
             .context("HOME is not set to an absolute path")?;
+
+        if let Some(root) = env::var_os("CLAUDE_ACCOUNT_HOME") {
+            let root = absolute_path(root, "CLAUDE_ACCOUNT_HOME")?;
+            return Ok(Self::from_roots_with_home(root.clone(), root, home));
+        }
 
         let configured_config_root = env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
@@ -50,10 +52,16 @@ impl AppPaths {
             }
         };
 
-        Ok(Self::from_roots(config_root, data_root))
+        Ok(Self::from_roots_with_home(config_root, data_root, home))
     }
 
+    #[cfg(test)]
     pub fn from_roots(config_dir: PathBuf, data_dir: PathBuf) -> Self {
+        let default_home = config_dir.join("default-home");
+        Self::from_roots_with_home(config_dir, data_dir, default_home)
+    }
+
+    fn from_roots_with_home(config_dir: PathBuf, data_dir: PathBuf, home: PathBuf) -> Self {
         let shim_dir = data_dir.join("bin");
         Self {
             state_file: config_dir.join("state.json"),
@@ -62,6 +70,8 @@ impl AppPaths {
             profiles_dir: data_dir.join("profiles"),
             shim: shim_dir.join("claude"),
             installed_executable: data_dir.join("libexec/claude-account"),
+            default_claude_dir: home.join(".claude"),
+            default_claude_json: home.join(".claude.json"),
             config_dir,
             data_dir,
             shim_dir,
@@ -109,7 +119,7 @@ fn macos_default_roots(home: &Path) -> Result<(PathBuf, PathBuf)> {
 
     match (application_support_state.exists(), legacy_state.exists()) {
         (true, true) => bail!(
-            "found claude-account state in both {} and {}; set CLAUDE_ACCOUNT_HOME to the installation you want to use, then remove or archive the other state after verifying its profiles",
+            "Found claude-account state in {} and {}. Set CLAUDE_ACCOUNT_HOME to the required installation. Verify and archive the other state.",
             application_support_state.display(),
             legacy_state.display()
         ),
@@ -179,7 +189,7 @@ mod tests {
 
         let error = macos_default_roots(temp.path()).unwrap_err();
 
-        assert!(error.to_string().contains("state in both"));
+        assert!(error.to_string().contains("state in"));
         assert!(error.to_string().contains("CLAUDE_ACCOUNT_HOME"));
     }
 }

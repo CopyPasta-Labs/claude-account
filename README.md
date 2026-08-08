@@ -1,196 +1,205 @@
 # claude-account
 
-[![CI](https://github.com/hamzarehmandeveloper/claude-account/actions/workflows/ci.yml/badge.svg)](https://github.com/hamzarehmandeveloper/claude-account/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/hamzarehmandeveloper/claude-account)](https://github.com/hamzarehmandeveloper/claude-account/releases)
+[![CI](https://github.com/CopyPasta-Labs/claude-account/actions/workflows/ci.yml/badge.svg)](https://github.com/CopyPasta-Labs/claude-account/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A cross-platform profile switcher for Claude Code on Linux and macOS. It gives
-Claude Code an isolated configuration and credential-storage directory for each
-account and transparently forwards normal commands to the official executable.
+`claude-account` switches the subscription account that new Claude Code processes use.
+The switch does not copy, read, refresh, or store OAuth credentials.
+The official Claude Code executable owns authentication and token refresh.
+
+This fork supports one default account and multiple isolated accounts.
+The default account keeps Claude Code's standard config files and Keychain entry.
+Each isolated account uses a fixed private config directory.
 
 ```bash
-claude account add work
-claude account add personal
-claude account use work
-claude account list
-claude account current
-claude account remove personal
+claude account adopt-default main --email main@example.com
+claude account add second --email second@example.com
 
-claude
-claude "fix this bug in main.py"
+claude account use main
+claude account use second
+claude account current
+claude account list
 ```
 
-Claude Code itself performs login, logout, credential storage, and token
-refresh. `claude-account` never reads or copies credential contents.
+The first login for an isolated account can require browser approval.
+Later switches do not require interaction while both OAuth sessions remain valid.
 
 > [!IMPORTANT]
-> This is an independent community project. It is not made, endorsed, or
-> supported by Anthropic. Claude and Claude Code are products of Anthropic.
+> This community project is not made, endorsed, or supported by Anthropic.
+> Claude and Claude Code are Anthropic products.
 
 ## Requirements
 
-- Linux, macOS 10.15 or later on Intel, or macOS 11 or later on Apple Silicon
-- A working Claude Code installation
-- Claude Code 2.1.144 or later on macOS, for profile-scoped Keychain credentials
-- Rust 1.85 or later to build from source
+- Linux or macOS
+- Claude Code 2.1.226 exactly
+- A valid Claude Pro, Max, Team, or Enterprise subscription for each profile
+- Rust 1.85.1 to build this source
 
-## Install a release
+This program supports the terminal CLI.
+It does not switch the graphical Claude Code extension for VS Code.
 
-Each release produces archives for Linux x86_64, macOS Apple Silicon, and
-macOS Intel:
+## Build and install
 
-| Platform | Target |
-| --- | --- |
-| Linux x86_64 | `x86_64-unknown-linux-gnu` |
-| macOS Apple Silicon | `aarch64-apple-darwin` |
-| macOS Intel | `x86_64-apple-darwin` |
-
-Set `VERSION` to a tag from the [releases page][releases]. The following picks
-the archive for the current machine, downloads it and its checksum, and verifies
-it with the checksum tool available on the platform:
+This fork does not publish binary releases. Build the reviewed source locally.
 
 ```bash
-VERSION=vX.Y.Z
-case "$(uname -s)-$(uname -m)" in
-  Linux-x86_64) TARGET=x86_64-unknown-linux-gnu ;;
-  Darwin-arm64) TARGET=aarch64-apple-darwin ;;
-  Darwin-x86_64) TARGET=x86_64-apple-darwin ;;
-  *) echo "No release for this platform" >&2; exit 1 ;;
-esac
-ARCHIVE="claude-account-${VERSION}-${TARGET}.tar.gz"
-curl -fLO "https://github.com/hamzarehmandeveloper/claude-account/releases/download/${VERSION}/${ARCHIVE}"
-curl -fLO "https://github.com/hamzarehmandeveloper/claude-account/releases/download/${VERSION}/${ARCHIVE}.sha256"
-if command -v sha256sum >/dev/null 2>&1; then
-  sha256sum --check "${ARCHIVE}.sha256"
-else
-  shasum -a 256 --check "${ARCHIVE}.sha256"
-fi
-tar -xzf "${ARCHIVE}"
-./claude-account install
+git clone https://github.com/CopyPasta-Labs/claude-account.git
+cd claude-account
+cargo build --locked --release
+./target/release/claude-account install
 ```
 
-The installer prints one `export PATH=...` line. Add it to your shell startup
-file (`~/.zshrc` for the default macOS shell or `~/.bashrc` for Bash) and open a
-new terminal. The shim lives in its own directory; it does not replace the
-official Claude executable.
-
-Release archives are checksum-protected but are not currently signed or
-notarized. If macOS Gatekeeper blocks a downloaded binary, build from source
-instead of bypassing the warning.
-
-Confirm the installation:
+The installer prints the shim directory.
+Put that directory before the official Claude Code directory in `PATH`.
 
 ```bash
 type -a claude
 claude account list
 ```
 
-The claude-account shim should appear before the official Claude executable.
+The `claude-account` shim must appear before the official `claude` executable.
+The installer rejects a real-Claude path that resolves to the manager or its shim.
 
-## Build from source
+## Set up two subscriptions
 
-```bash
-git clone https://github.com/hamzarehmandeveloper/claude-account.git
-cd claude-account
-cargo build --locked --release
-./target/release/claude-account install
-```
+Use this procedure when the current default Claude Code login is the first account.
+
+1. Register the default account.
+
+   ```bash
+   claude account adopt-default main --email main@example.com
+   ```
+
+2. Add the second account.
+
+   ```bash
+   claude account add second --email second@example.com
+   ```
+
+3. Complete the official OAuth flow when Claude Code opens it.
+
+4. Select an account before you start a new Claude process.
+
+   ```bash
+   claude account use main
+   claude account use second
+   ```
+
+Existing Claude processes keep their original accounts.
+Only new processes use the newly selected profile.
 
 ## Commands
 
-### Add an account
+### Register the default account
 
 ```bash
-claude account add work
-claude account add personal --email you@example.com
-claude account add company --sso
-claude account add api-billing --console
+claude account adopt-default NAME --email EMAIL
 ```
 
-This opens Claude Code's official login flow. The first profile becomes active.
-Adding another profile does not switch the active profile. The command also
-completes Claude Code's local onboarding state, so the next `claude` launch
-uses the saved login without asking you to authenticate again.
+This command does not start a login.
+It verifies the current default Claude Code subscription and registers it.
+Only one profile can use the default location.
 
-On macOS, profile names must also be unique when compared without ASCII letter
-case, preventing two names from sharing one directory on common
-case-insensitive filesystems.
-
-If a state file created on a case-sensitive system already contains variants
-such as `Work` and `work`, normal commands fail closed on macOS. Choose the
-exact spelling to unregister and run the explicit recovery command:
+### Add an isolated account
 
 ```bash
-claude account resolve-case-collision work
-# Or invoke the manager directly:
-claude-account resolve-case-collision work
+claude account add NAME --email EMAIL
+claude account add COMPANY --email EMAIL --sso
 ```
 
-This only unregisters that exact name from the state file. It does not run
-Claude Code, log out, delete or rename either profile directory, or touch
-Keychain credentials. The command names the surviving profile and, when the
-removed name was active, the `claude account use NAME` step that completes
-recovery. It refuses profiles that do not have a case-colliding sibling.
+The email is required.
+Claude Code runs its official subscription login flow.
+The program registers the profile only after all identity checks pass.
 
-### Switch accounts
+The command preserves the profile directory after a failed login.
+Use the preserved directory to diagnose the failure or retry.
 
-```bash
-claude account use work
-```
-
-Switching affects newly launched Claude processes. Existing sessions keep the
-account with which they were started.
-
-### Inspect profiles
+### Select and inspect profiles
 
 ```bash
+claude account use NAME
 claude account list
 claude account current
 ```
 
-`current` prints only the profile name, making it safe to use in scripts.
+`current` prints only the active profile name.
 
-### Remove an account
-
-```bash
-claude account remove personal
-```
-
-This runs Claude Code's official `auth logout` inside the profile and
-unregisters it. Settings and session history are preserved, allowing the same
-profile name to reuse them later.
-
-To delete all local data belonging to the profile:
+### Repair a login
 
 ```bash
-claude account remove personal --purge --yes
+claude account reauth NAME
+claude account reauth NAME --sso
 ```
 
-Removing the active profile is refused unless `--force` is supplied.
-`--purge` permanently deletes that profile's settings, sessions, plugins, and
-history in addition to its stored login.
+This command runs the official login flow for the stored email.
+It bypasses the normal preflight check, then verifies the new login.
 
-### Get help
+These direct recovery commands also bypass the normal preflight check:
 
 ```bash
-claude account --help
-claude account add --help
-claude account remove --help
+claude auth login
+claude auth logout
+claude auth status --json
 ```
 
-All non-account commands and flags are passed unchanged to the official Claude
-executable:
+### Remove a profile
 
 ```bash
-claude
-claude -p "explain this project"
-claude --model opus
-claude auth status --text
+claude account remove NAME
 ```
 
-## Storage
+This command runs Claude Code's official logout and unregisters the profile.
+It preserves settings, sessions, plugins, and history.
 
-Linux defaults:
+The program currently rejects `remove --purge`.
+Profile deletion will remain disabled until the delete operation is transactional.
+
+## Identity checks
+
+The program runs `claude auth status --json` before each normal Claude launch.
+It requires all these values:
+
+```text
+loggedIn = true
+authMethod = claude.ai
+apiProvider = firstParty
+email = the profile email
+subscriptionType = pro, max, team, or enterprise
+```
+
+The program also checks `oauthAccount.emailAddress` in Claude's local account file.
+That email must match the status output and the registered profile.
+
+These checks reject provider credentials, API-key helpers, wrong accounts, and logged-out sessions.
+The preflight uses the launch values for `--settings`, `--setting-sources`, and `--safe-mode`.
+The manager rejects `--bare` because that option disables subscription OAuth.
+The program does not delete or edit a profile's Claude settings.
+
+Claude can reload settings and managed policy during a running session.
+The manager verifies the identity at process start and does not monitor later changes.
+
+## Profile locations
+
+The default profile uses these paths:
+
+```text
+~/.claude/
+~/.claude.json
+~/.claude/.anthropic/
+```
+
+The manager unsets `CLAUDE_CONFIG_DIR` and `CLAUDE_SECURESTORAGE_CONFIG_DIR` for this profile.
+Claude Code continues to use its default Keychain entry.
+
+An isolated profile uses these variables:
+
+```text
+CLAUDE_CONFIG_DIR=<profile>
+CLAUDE_SECURESTORAGE_CONFIG_DIR=<profile>
+ANTHROPIC_CONFIG_DIR=<profile>/.anthropic
+```
+
+Linux stores manager data in these default locations:
 
 ```text
 ~/.config/claude-account/state.json
@@ -199,58 +208,33 @@ Linux defaults:
 ~/.local/share/claude-account/libexec/claude-account
 ```
 
-macOS defaults, matching the tested `claude-account-macos` layout:
+macOS stores manager data in this default location:
 
 ```text
-~/Library/Application Support/claude-account/state.json
-~/Library/Application Support/claude-account/profiles/<name>/
-~/Library/Application Support/claude-account/bin/claude
-~/Library/Application Support/claude-account/libexec/claude-account
+~/Library/Application Support/claude-account/
 ```
 
-The standard `XDG_CONFIG_HOME` and `XDG_DATA_HOME` variables are respected on
-both platforms. `CLAUDE_ACCOUNT_HOME` can place all application data under one
-absolute directory, which is especially useful for tests.
+`XDG_CONFIG_HOME` and `XDG_DATA_HOME` can change the manager locations.
+`CLAUDE_ACCOUNT_HOME` can set one absolute root for tests or custom installations.
 
-On macOS, an existing XDG-style installation is reused automatically when no
-Application Support state exists. If state exists in both layouts, the program
-fails closed and asks you to select one explicitly with `CLAUDE_ACCOUNT_HOME`;
-it never guesses between two account registries.
+The state file contains profile names, expected emails, profile locations, and the real executable path.
+It does not contain OAuth tokens, API keys, or Keychain data.
 
-Existing OAuth profiles created by
-[`Kerber0ss/claude-account-macos`](https://github.com/Kerber0ss/claude-account-macos)
-remain readable in the native Application Support layout. Its API-key profiles
-are intentionally not imported in this release: the program reports a clear
-error without reading or migrating their keys.
+## Authentication environment
 
-The state file contains profile names, directory paths, and the real Claude
-executable path. It never contains access or refresh tokens.
+The manager removes inherited authentication, provider, endpoint, gateway, and host-auth variables.
+It preserves unrelated shell, proxy, certificate, cloud-tool, and session variables.
 
-## macOS credential isolation
+There is no environment override that disables this filtering.
+See [the security review](SECURITY-REVIEW.md) for the reviewed variable classes.
 
-Claude Code stores subscription credentials in macOS Keychain. Claude Code
-2.1.144 and later supports configuration-directory-scoped Keychain entries,
-allowing each claude-account profile to keep an independent login.
-claude-account passes both `CLAUDE_CONFIG_DIR` and
-`CLAUDE_SECURESTORAGE_CONFIG_DIR` as the same private profile directory and
-overrides inherited values for every managed Claude process. It checks the
-Claude Code version before login, launch, and logout on macOS so an older global
-Keychain entry cannot silently select or log out the wrong account.
+## State migration
 
-claude-account never reads, copies, or writes Keychain credential contents;
-Claude Code continues to own login, token refresh, and secure storage.
+State version 2 stores the expected email and the profile location.
+Version 1 isolated profiles migrate when their `.claude.json` file contains `oauthAccount.emailAddress`.
+The program rejects a migration when it cannot identify the stored account.
 
-## Authentication environment variables
-
-To guarantee that the selected profile is actually used, the wrapper removes
-these variables from the child Claude process:
-
-- `ANTHROPIC_API_KEY`
-- `ANTHROPIC_AUTH_TOKEN`
-- `CLAUDE_CODE_OAUTH_TOKEN`
-
-Set `CLAUDE_ACCOUNT_PRESERVE_AUTH_ENV=1` if you intentionally want those
-variables to override profile authentication.
+The program rejects imported API profiles without reading or migrating their API keys.
 
 ## Development
 
@@ -260,11 +244,10 @@ cargo test --locked --all-targets
 cargo clippy --locked --all-targets -- -D warnings
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution workflow and
-[SECURITY.md](SECURITY.md) for private vulnerability reporting.
+The manager rejects unaudited Claude Code versions.
+GitHub Actions use commit-pinned actions.
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
 
 ## License
 
-Released under the [MIT License](LICENSE).
-
-[releases]: https://github.com/hamzarehmandeveloper/claude-account/releases
+This project uses the [MIT License](LICENSE).
