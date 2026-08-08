@@ -966,7 +966,6 @@ mod tests {
         )
         .unwrap();
         let profile = Profile::isolated(config_dir, "work@example.com");
-        let fake_claude = temp.path().join("claude");
         let cases = [
             (
                 r#"{"loggedIn":false,"authMethod":"claude.ai","apiProvider":"firstParty","email":"work@example.com","subscriptionType":"max"}"#,
@@ -990,7 +989,8 @@ mod tests {
             ),
         ];
 
-        for (json, expected) in cases {
+        for (index, (json, expected)) in cases.into_iter().enumerate() {
+            let fake_claude = temp.path().join(format!("claude-{index}"));
             fs::write(
                 &fake_claude,
                 format!("#!/bin/sh\nprintf '%s\\n' '{json}'\n"),
