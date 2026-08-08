@@ -7,6 +7,40 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+This fork will use version 0.3.0.
+
+### Added
+
+- Add a default profile location that keeps the standard Claude Code Keychain entry.
+- Add `adopt-default` and `reauth` account commands.
+- Store and verify the expected subscription email for each profile.
+- Set `ANTHROPIC_CONFIG_DIR` for default and isolated profiles.
+
+### Changed
+
+- Require the audited Claude Code 2.1.226 release on all supported systems.
+- Verify the authentication method, provider, email, subscription type, and local account email.
+- Remove inherited authentication, provider, endpoint, gateway, and host-auth variables.
+- Remove inherited session credentials and account identity selectors.
+- Apply authentication-related launch settings to the identity preflight.
+- Reject `--bare` because it disables subscription OAuth.
+- Migrate version 1 isolated profiles to state version 2 when an account email exists.
+- Reject `remove --purge` until profile deletion is transactional.
+
+### Security
+
+- Reject symlink components in managed directory paths.
+- Open state and lock files with no-follow protection.
+- Validate all loaded profile paths and metadata.
+- Serialize installation and reject recursive real-Claude paths.
+- Pin one canonical real-Claude path for each operation.
+- Limit the Claude version probe on Linux and macOS.
+- Serialize each launch with login and logout changes for that profile.
+- Sync parent directories after atomic state writes.
+- Reset existing state and lock file permissions.
+- Pin GitHub Actions to full commit identifiers.
+- Remove the unsigned binary release workflow.
+
 ## [0.2.0] - 2026-08-04
 
 ### Added
@@ -69,7 +103,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Non-invasive shim installation that preserves the official Claude launcher.
 - Unit and end-to-end lifecycle tests.
 
-[Unreleased]: https://github.com/hamzarehmandeveloper/claude-account/compare/v0.2.0...HEAD
-[0.2.0]: https://github.com/hamzarehmandeveloper/claude-account/compare/v0.1.1...v0.2.0
-[0.1.1]: https://github.com/hamzarehmandeveloper/claude-account/compare/v0.1.0...v0.1.1
-[0.1.0]: https://github.com/hamzarehmandeveloper/claude-account/releases/tag/v0.1.0
+[Unreleased]: https://github.com/CopyPasta-Labs/claude-account/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/CopyPasta-Labs/claude-account/compare/v0.1.1...v0.2.0
+[0.1.1]: https://github.com/CopyPasta-Labs/claude-account/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/CopyPasta-Labs/claude-account/releases/tag/v0.1.0
