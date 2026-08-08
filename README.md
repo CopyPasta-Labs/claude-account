@@ -24,6 +24,11 @@ claude account list
 The first login for an isolated account can require browser approval.
 Later switches do not require interaction while both OAuth sessions remain valid.
 
+## Documentation
+
+- [What this fork provides and how to use it](docs/USAGE.md)
+- [Complete fork changes and reasons](docs/FORK-CHANGES.md)
+
 > [!IMPORTANT]
 > This community project is not made, endorsed, or supported by Anthropic.
 > Claude and Claude Code are Anthropic products.
