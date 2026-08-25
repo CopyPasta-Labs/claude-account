@@ -122,13 +122,13 @@ fn add(paths: &AppPaths, name: &str, email: &str, sso: bool) -> Result<()> {
 
     let real_claude =
         process::resolve_real_claude(initial_real_claude.as_deref(), &current_executable, paths)?;
-    process::validate_platform_support(&real_claude)?;
+    process::validate_platform_support(&real_claude.executable)?;
     let profile_dir = paths.profile_dir(name);
     state::ensure_private_dir(&profile_dir)?;
     let profile = Profile::isolated(profile_dir, email);
 
     println!("Logging in profile `{name}` using Claude Code...");
-    let mut login = process::managed_command(&real_claude, &profile, paths)?;
+    let mut login = process::managed_command(&real_claude.executable, &profile, paths)?;
     login.args(["auth", "login", "--email", email]);
     if sso {
         login.arg("--sso");
@@ -140,7 +140,7 @@ fn add(paths: &AppPaths, name: &str, email: &str, sso: bool) -> Result<()> {
         );
     }
 
-    process::validate_profile_identity(&real_claude, &profile, paths)
+    process::validate_profile_identity(&real_claude.executable, &profile, paths)
         .with_context(|| format!("login verification failed for profile `{name}`"))?;
 
     complete_claude_onboarding(&profile.claude_json_path(paths))?;
@@ -155,8 +155,8 @@ fn add(paths: &AppPaths, name: &str, email: &str, sso: bool) -> Result<()> {
         validate_new_profile_name(&state, name)?;
 
         first_profile = state.profiles.is_empty();
-        if state.real_claude == initial_real_claude {
-            state.real_claude = Some(real_claude);
+        if state.real_claude == initial_real_claude && real_claude.should_persist_launcher() {
+            state.real_claude = Some(real_claude.launcher.clone());
         }
         state.profiles.insert(name.to_owned(), profile);
         if first_profile {
@@ -197,9 +197,9 @@ fn adopt_default(paths: &AppPaths, name: &str, email: &str) -> Result<()> {
 
     let real_claude =
         process::resolve_real_claude(initial_real_claude.as_deref(), &current_executable, paths)?;
-    process::validate_platform_support(&real_claude)?;
+    process::validate_platform_support(&real_claude.executable)?;
     let profile = Profile::default(email);
-    process::validate_profile_identity(&real_claude, &profile, paths)
+    process::validate_profile_identity(&real_claude.executable, &profile, paths)
         .with_context(|| format!("default account verification failed for profile `{name}`"))?;
 
     let first_profile;
@@ -218,8 +218,8 @@ fn adopt_default(paths: &AppPaths, name: &str, email: &str) -> Result<()> {
         }
         validate_new_profile_name(&state, name)?;
         first_profile = state.profiles.is_empty();
-        if state.real_claude == initial_real_claude {
-            state.real_claude = Some(real_claude);
+        if state.real_claude == initial_real_claude && real_claude.should_persist_launcher() {
+            state.real_claude = Some(real_claude.launcher.clone());
         }
         state.profiles.insert(name.to_owned(), profile);
         if first_profile {
@@ -239,7 +239,7 @@ fn adopt_default(paths: &AppPaths, name: &str, email: &str) -> Result<()> {
 fn reauth(paths: &AppPaths, name: &str, sso: bool) -> Result<()> {
     validate_profile_name(name)?;
     let _profile_reservation = ProfileReservation::acquire(paths, name)?;
-    let (profile, real_claude) = {
+    let (profile, initial_real_claude) = {
         let _state_lock = StateLock::acquire(paths)?;
         let state = state::load(paths)?;
         let profile = state
@@ -247,18 +247,15 @@ fn reauth(paths: &AppPaths, name: &str, sso: bool) -> Result<()> {
             .get(name)
             .cloned()
             .with_context(|| format!("profile `{name}` does not exist"))?;
-        let real_claude = state
-            .real_claude
-            .clone()
-            .context("real Claude executable is not configured")?;
-        (profile, real_claude)
+        (profile, state.real_claude.clone())
     };
 
     let current_executable = env::current_exe().context("failed to locate this executable")?;
-    let real_claude = process::pin_real_claude_candidate(&real_claude, &current_executable, paths)?;
-    process::validate_platform_support(&real_claude)?;
+    let real_claude =
+        process::resolve_real_claude(initial_real_claude.as_deref(), &current_executable, paths)?;
+    process::validate_platform_support(&real_claude.executable)?;
     println!("Logging in profile `{name}` using Claude Code...");
-    let mut login = process::managed_command(&real_claude, &profile, paths)?;
+    let mut login = process::managed_command(&real_claude.executable, &profile, paths)?;
     login.args(["auth", "login", "--email", &profile.email]);
     if sso {
         login.arg("--sso");
@@ -267,9 +264,29 @@ fn reauth(paths: &AppPaths, name: &str, sso: bool) -> Result<()> {
     if !status.success() {
         bail!("Claude login failed for profile `{name}`");
     }
-    process::validate_profile_identity(&real_claude, &profile, paths)
+    process::validate_profile_identity(&real_claude.executable, &profile, paths)
         .with_context(|| format!("login verification failed for profile `{name}`"))?;
+    persist_resolved_launcher_if_unchanged(paths, &initial_real_claude, &real_claude)?;
     println!("Reauthenticated `{name}`.");
+    Ok(())
+}
+
+fn persist_resolved_launcher_if_unchanged(
+    paths: &AppPaths,
+    initial_real_claude: &Option<PathBuf>,
+    real_claude: &process::RealClaudeResolution,
+) -> Result<()> {
+    if !real_claude.should_persist_launcher() {
+        return Ok(());
+    }
+    let _state_lock = StateLock::acquire(paths)?;
+    let mut state = state::load(paths)?;
+    if &state.real_claude == initial_real_claude
+        && state.real_claude.as_deref() != Some(real_claude.launcher.as_path())
+    {
+        state.real_claude = Some(real_claude.launcher.clone());
+        state::save(paths, &state)?;
+    }
     Ok(())
 }
 
@@ -432,7 +449,7 @@ fn remove_with_purge(
         bail!("`remove --purge` is disabled until profile deletion is transactional");
     }
     let _profile_reservation = ProfileReservation::acquire(paths, name)?;
-    let (profile, real_claude) = {
+    let (profile, initial_real_claude) = {
         let _lock = StateLock::acquire(paths)?;
         let state = state::load(paths)?;
         let profile = state
@@ -440,24 +457,21 @@ fn remove_with_purge(
             .get(name)
             .cloned()
             .with_context(|| format!("profile `{name}` does not exist"))?;
-        let real_claude = state
-            .real_claude
-            .clone()
-            .context("real Claude executable is not configured")?;
         let is_active = state.active.as_deref() == Some(name);
         if is_active && !force {
             bail!(
                 "`{name}` is active. Select another profile, or use --force to leave no active profile."
             );
         }
-        (profile, real_claude)
+        (profile, state.real_claude.clone())
     };
 
     let current_executable = env::current_exe().context("failed to locate this executable")?;
-    let real_claude = process::pin_real_claude_candidate(&real_claude, &current_executable, paths)?;
-    process::validate_platform_support(&real_claude)?;
+    let real_claude =
+        process::resolve_real_claude(initial_real_claude.as_deref(), &current_executable, paths)?;
+    process::validate_platform_support(&real_claude.executable)?;
     println!("Logging out profile `{name}`...");
-    let logout_status = process::managed_command(&real_claude, &profile, paths)?
+    let logout_status = process::managed_command(&real_claude.executable, &profile, paths)?
         .args(["auth", "logout"])
         .status()
         .context("failed to start Claude logout")?;
@@ -471,6 +485,9 @@ fn remove_with_purge(
         state.profiles.remove(name);
         if state.active.as_deref() == Some(name) {
             state.active = None;
+        }
+        if state.real_claude == initial_real_claude && real_claude.should_persist_launcher() {
+            state.real_claude = Some(real_claude.launcher.clone());
         }
         state::save(paths, &state)?;
     }
@@ -497,7 +514,7 @@ fn install(paths: &AppPaths, explicit_real: Option<&Path>) -> Result<()> {
         }
         None => process::resolve_real_claude(configured.as_deref(), &current_executable, paths)?,
     };
-    process::validate_platform_support(&real_claude)?;
+    process::validate_platform_support(&real_claude.executable)?;
 
     state::ensure_private_dir(&paths.data_dir)?;
     state::ensure_private_dir(&paths.shim_dir)?;
@@ -575,11 +592,13 @@ fn install(paths: &AppPaths, explicit_real: Option<&Path>) -> Result<()> {
         state::sync_parent_directory(&paths.shim)?;
     }
 
-    account_state.real_claude = Some(real_claude.clone());
+    if real_claude.should_persist_launcher() {
+        account_state.real_claude = Some(real_claude.launcher.clone());
+    }
     state::save(paths, &account_state)?;
 
     println!("Installed claude-account.");
-    println!("Real Claude: {}", real_claude.display());
+    println!("Real Claude: {}", real_claude.launcher.display());
     println!("Shim: {}", paths.shim.display());
     println!();
     println!("Put this directory before the real Claude directory in PATH:");
@@ -646,6 +665,34 @@ mod tests {
             assert!(!state::is_valid_profile_email(invalid), "{invalid:?}");
         }
         assert!(state::is_valid_profile_email("work@example.com"));
+    }
+
+    #[test]
+    fn install_stores_stable_launcher_not_version_leaf() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_roots(temp.path().join("config"), temp.path().join("data"));
+        let versions = temp.path().join("versions");
+        fs::create_dir(&versions).unwrap();
+        let version_leaf = versions.join("claude-2.1.226");
+        fs::write(
+            &version_leaf,
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"--version\" ]; then\n\
+               printf '2.1.226 (Claude Code)\\n'\n\
+               exit 0\n\
+             fi\n\
+             exit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&version_leaf, fs::Permissions::from_mode(0o755)).unwrap();
+        let launcher = temp.path().join("claude");
+        symlink(&version_leaf, &launcher).unwrap();
+
+        install(&paths, Some(&launcher)).unwrap();
+
+        let stored = state::load(&paths).unwrap().real_claude.unwrap();
+        assert_eq!(stored, launcher);
+        assert_ne!(stored, fs::canonicalize(version_leaf).unwrap());
     }
 
     #[test]
