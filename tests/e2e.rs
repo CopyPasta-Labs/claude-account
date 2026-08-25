@@ -4,9 +4,30 @@ use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
+static INVOCATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn invocation_lock() -> MutexGuard<'static, ()> {
+    INVOCATION_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap()
+}
+
 fn invoke(
+    program: &Path,
+    account_home: &Path,
+    home: &Path,
+    arguments: &[&OsStr],
+    environment: &[(&str, &OsStr)],
+) -> Output {
+    let _invocation_lock = invocation_lock();
+    invoke_unlocked(program, account_home, home, arguments, environment)
+}
+
+fn invoke_unlocked(
     program: &Path,
     account_home: &Path,
     home: &Path,
@@ -700,8 +721,9 @@ fn version_probe_timeout_terminates_its_descendant() {
     .unwrap();
     fs::set_permissions(&fake_claude, fs::Permissions::from_mode(0o755)).unwrap();
 
+    let _invocation_lock = invocation_lock();
     let started = Instant::now();
-    let output = invoke(
+    let output = invoke_unlocked(
         binary,
         &account_home,
         &home,

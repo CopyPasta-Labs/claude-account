@@ -1,8 +1,9 @@
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
 use std::io::{self, Read};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -17,111 +18,16 @@ use serde::Deserialize;
 use crate::paths::AppPaths;
 use crate::state::{self, Profile, ProfileLocation, ProfileReservation, StateLock};
 
-const DOCUMENTED_AUTH_ENVIRONMENT: &[&str] = &[
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "ANTHROPIC_SCOPE",
-    "CLAUDE_CODE_OAUTH_TOKEN",
-    "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
-    "CLAUDE_CODE_OAUTH_SCOPES",
-    "ANTHROPIC_PROFILE",
-    "ANTHROPIC_FEDERATION_RULE_ID",
-    "ANTHROPIC_ORGANIZATION_ID",
-    "ANTHROPIC_SERVICE_ACCOUNT_ID",
-    "ANTHROPIC_WORKSPACE_ID",
-    "ANTHROPIC_IDENTITY_TOKEN",
-    "ANTHROPIC_IDENTITY_TOKEN_FILE",
-    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
-    "CLAUDE_CODE_USE_BEDROCK",
-    "CLAUDE_CODE_USE_FOUNDRY",
-    "CLAUDE_CODE_USE_MANTLE",
-    "CLAUDE_CODE_USE_VERTEX",
-    "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
-    "ANTHROPIC_BASE_URL",
-    "ANTHROPIC_CUSTOM_HEADERS",
-    "ANTHROPIC_AWS_API_KEY",
-    "AWS_BEARER_TOKEN_BEDROCK",
-    "ANTHROPIC_AWS_BASE_URL",
-    "ANTHROPIC_AWS_WORKSPACE_ID",
-    "ANTHROPIC_BEDROCK_BASE_URL",
-    "ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
-    "ANTHROPIC_FOUNDRY_API_KEY",
-    "ANTHROPIC_FOUNDRY_AUTH_TOKEN",
-    "ANTHROPIC_FOUNDRY_BASE_URL",
-    "ANTHROPIC_FOUNDRY_RESOURCE",
-    "ANTHROPIC_VERTEX_BASE_URL",
-    "ANTHROPIC_VERTEX_PROJECT_ID",
-    "CLAUDE_CODE_SKIP_ANTHROPIC_AWS_AUTH",
-    "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
-    "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
-    "CLAUDE_CODE_SKIP_MANTLE_AUTH",
-    "CLAUDE_CODE_SKIP_VERTEX_AUTH",
+const AUTH_ENVIRONMENT_PREFIXES: &[&[u8]] = &[b"ANTHROPIC_", b"CLAUDE_", b"CCR_", b"AGENT_PROXY_"];
+const AUTH_ENVIRONMENT_NAMES: &[&[u8]] = &[
+    b"_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL",
+    b"AWS_BEARER_TOKEN_BEDROCK",
+    b"ENVIRONMENT_SERVICE_KEY",
+    b"USE_LOCAL_OAUTH",
+    b"USE_STAGING_OAUTH",
 ];
 
-const DEFENSIVE_2_1_226_AUTH_ENVIRONMENT: &[&str] = &[
-    "CLAUDE_CODE_USE_GATEWAY",
-    "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
-    "ANTHROPIC_GOOGLE_CLOUD_BASE_URL",
-    "ANTHROPIC_GOOGLE_CLOUD_LOCATION",
-    "ANTHROPIC_GOOGLE_CLOUD_PROJECT",
-    "ANTHROPIC_GOOGLE_CLOUD_WORKSPACE_ID",
-    "CLAUDE_CODE_SKIP_ANTHROPIC_GOOGLE_CLOUD_AUTH",
-    "ANTHROPIC_UNIX_SOCKET",
-    "CLAUDE_CODE_API_BASE_URL",
-    "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
-    "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
-    "CLAUDE_CODE_WEBSOCKET_AUTH_FILE_DESCRIPTOR",
-    "CCR_OAUTH_TOKEN_FILE",
-    "CLAUDE_CODE_HOST_CREDS_FILE",
-    "CLAUDE_CODE_HOST_AUTH_ENV_VAR",
-    "CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH",
-    "CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH",
-    "CLAUDE_CODE_CUSTOM_OAUTH_URL",
-    "CLAUDE_CODE_OAUTH_CLIENT_ID",
-    "CLAUDE_LOCAL_OAUTH_API_BASE",
-    "CLAUDE_LOCAL_OAUTH_APPS_BASE",
-    "CLAUDE_LOCAL_OAUTH_CONSOLE_BASE",
-    "USE_LOCAL_OAUTH",
-    "USE_STAGING_OAUTH",
-    "CLAUDE_BG_AUTH_SNAPSHOT_PATH",
-    "CLAUDE_BG_CLAIM_AUTH",
-    "CLAUDE_BG_PTY_AUTH",
-    "CLAUDE_BG_RV_AUTH",
-    "CLAUDE_BG_SOCKET_TOKENS_PATH",
-    "CLAUDE_CODE_SESSION_ACCESS_TOKEN",
-    "CLAUDE_SESSION_INGRESS_TOKEN_FILE",
-    "CLAUDE_TRUSTED_DEVICE_TOKEN",
-    "CLAUDE_CODE_ARTIFACTS_API_TOKEN",
-    "CLAUDE_BRIDGE_OAUTH_TOKEN",
-    "CLAUDE_CODE_HFI_BEARER_TOKEN",
-    "AGENT_PROXY_AUTH_TOKEN",
-    "ENVIRONMENT_SERVICE_KEY",
-    "CLAUDE_CODE_ACCOUNT_UUID",
-    "CLAUDE_CODE_ORGANIZATION_UUID",
-    "CLAUDE_CODE_USER_EMAIL",
-    "CLAUDE_CODE_SUBSCRIPTION_TYPE",
-    "CLAUDE_CODE_RATE_LIMIT_TIER",
-    "CLAUDE_CODE_ENVIRONMENT_KIND",
-    "CLAUDE_CODE_REMOTE_SESSION_ID",
-    "CLAUDE_CODE_REMOTE_SESSION_ORIGIN",
-    "CLAUDE_CODE_REMOTE",
-    "CLAUDE_CODE_SESSION_KIND",
-    "CLAUDE_CODE_ACCOUNT_TAGGED_ID",
-    "CLAUDE_CODE_DESIGN_OAUTH_CLIENT_ID",
-    "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL",
-    "CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL",
-    "CLAUDE_BRIDGE_BASE_URL",
-    "CLAUDE_BRIDGE_SESSION_INGRESS_URL",
-    "CLAUDE_CODE_ARTIFACTS_API_BASE_URL",
-    "CLAUDE_CODE_ARTIFACT_ASSET_BASE_URL",
-    "CLAUDE_CODE_ARTIFACT_LIVE_BASE_URL",
-    "CLAUDE_CODE_GB_BASE_URL",
-    "CLAUDE_RUNNER_API_BASE_URL",
-    "CLAUDE_REMOTE_TOOLS_BRIDGE_URL",
-    "AGENT_PROXY_URL",
-];
-
-const AUDITED_CLAUDE_VERSION: (u64, u64, u64) = (2, 1, 226);
+const MIN_SUPPORTED_CLAUDE_VERSION: (u64, u64, u64) = (2, 1, 226);
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const VERSION_PROBE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -258,14 +164,24 @@ pub fn managed_command(real_claude: &Path, profile: &Profile, paths: &AppPaths) 
 
 fn command_without_auth_environment(program: &Path) -> Command {
     let mut command = Command::new(program);
-    for variable in DOCUMENTED_AUTH_ENVIRONMENT
-        .iter()
-        .chain(DEFENSIVE_2_1_226_AUTH_ENVIRONMENT)
-        .copied()
-    {
-        command.env_remove(variable);
-    }
+    remove_auth_environment(&mut command, env::vars_os().map(|(name, _)| name));
     command
+}
+
+fn remove_auth_environment(command: &mut Command, variables: impl IntoIterator<Item = OsString>) {
+    for variable in variables {
+        if is_auth_environment_variable(&variable) {
+            command.env_remove(variable);
+        }
+    }
+}
+
+fn is_auth_environment_variable(variable: &OsStr) -> bool {
+    let variable = variable.as_bytes();
+    AUTH_ENVIRONMENT_PREFIXES
+        .iter()
+        .any(|prefix| variable.starts_with(prefix))
+        || AUTH_ENVIRONMENT_NAMES.contains(&variable)
 }
 
 #[derive(Debug, Deserialize)]
@@ -372,7 +288,7 @@ pub fn validate_platform_support(real_claude: &Path) -> Result<()> {
 
     if !output.status.success() {
         bail!(
-            "Failed to query the Claude Code version from {}. Only audited Claude Code 2.1.226 is supported.",
+            "Failed to query the Claude Code version from {}. Supported versions are stable Claude Code 2.x releases from 2.1.226.",
             real_claude.display()
         );
     }
@@ -386,11 +302,13 @@ pub fn validate_platform_support(real_claude: &Path) -> Result<()> {
     };
     let version = parse_claude_version(reported).with_context(|| {
         format!(
-            "Could not parse Claude Code version `{reported}`. Only audited Claude Code 2.1.226 is supported."
+            "Could not parse Claude Code version `{reported}`. Supported versions are stable Claude Code 2.x releases from 2.1.226."
         )
     })?;
     if !version.is_supported() {
-        bail!("Only audited Claude Code 2.1.226 is supported. Version {version} is installed.");
+        bail!(
+            "Supported versions are stable Claude Code 2.x releases from 2.1.226. Version {version} is installed."
+        );
     }
 
     Ok(())
@@ -470,7 +388,7 @@ fn timeout_version_probe(probe: &mut VersionProbe, real_claude: &Path) -> Result
         )
     })?;
     bail!(
-        "The Claude Code version query timed out for {}. Only audited Claude Code 2.1.226 is supported.",
+        "The Claude Code version query timed out for {}. Supported versions are stable Claude Code 2.x releases from 2.1.226.",
         real_claude.display()
     )
 }
@@ -586,7 +504,7 @@ struct ClaudeVersion {
 impl ClaudeVersion {
     fn is_supported(&self) -> bool {
         let numeric_core = (self.major, self.minor, self.patch);
-        numeric_core == AUDITED_CLAUDE_VERSION && self.prerelease.is_none()
+        self.major == 2 && numeric_core >= MIN_SUPPORTED_CLAUDE_VERSION && self.prerelease.is_none()
     }
 }
 
@@ -768,15 +686,18 @@ mod tests {
     }
 
     #[test]
-    fn accepts_only_the_audited_version() {
+    fn accepts_stable_2x_versions_from_the_supported_floor() {
         let supports = |version| parse_claude_version(version).unwrap().is_supported();
 
+        assert!(!supports("1.99.999"));
         assert!(!supports("2.1.225"));
         assert!(!supports("2.1.226-beta.1"));
         assert!(supports("2.1.226"));
         assert!(supports("2.1.226+build.1"));
-        assert!(!supports("2.1.227-beta.1"));
-        assert!(!supports("2.1.227"));
+        assert!(supports("2.1.237"));
+        assert!(supports("2.2.0"));
+        assert!(!supports("2.2.0-rc.1"));
+        assert!(!supports("3.0.0"));
     }
 
     #[test]
@@ -788,23 +709,67 @@ mod tests {
     }
 
     #[test]
-    fn managed_command_removes_every_reviewed_auth_variable() {
-        let temp = tempfile::tempdir().unwrap();
-        let paths = AppPaths::from_roots(temp.path().join("config"), temp.path().join("data"));
-        let profile = Profile::isolated(paths.profile_dir("work"), "work@example.com");
-        let command = managed_command(Path::new("/usr/bin/env"), &profile, &paths).unwrap();
+    fn auth_environment_filter_covers_future_namespaces() {
+        for variable in [
+            "ANTHROPIC_FUTURE_PROVIDER",
+            "CLAUDE_FUTURE_TOKEN",
+            "CLAUDE_CODE_FUTURE_TOKEN",
+            "CCR_FUTURE_TOKEN_FILE",
+            "AGENT_PROXY_FUTURE_TOKEN",
+            "AWS_BEARER_TOKEN_BEDROCK",
+            "USE_LOCAL_OAUTH",
+            "USE_STAGING_OAUTH",
+            "ENVIRONMENT_SERVICE_KEY",
+        ] {
+            assert!(
+                is_auth_environment_variable(std::ffi::OsStr::new(variable)),
+                "{variable} was not classified"
+            );
+        }
+
+        for variable in [
+            "AWS_PROFILE",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "SSL_CERT_FILE",
+            "PATH",
+            "CLAUDE",
+        ] {
+            assert!(
+                !is_auth_environment_variable(std::ffi::OsStr::new(variable)),
+                "{variable} was classified"
+            );
+        }
+    }
+
+    #[test]
+    fn command_removes_namespaced_auth_environment() {
+        let mut command = Command::new("/usr/bin/env");
+        remove_auth_environment(
+            &mut command,
+            [
+                OsString::from("ANTHROPIC_FUTURE_PROVIDER"),
+                OsString::from("CLAUDE_CODE_FUTURE_TOKEN"),
+                OsString::from("CCR_FUTURE_TOKEN_FILE"),
+                OsString::from("AGENT_PROXY_FUTURE_TOKEN"),
+                OsString::from("AWS_PROFILE"),
+            ],
+        );
         let environment = command_environment(&command);
 
-        for variable in DOCUMENTED_AUTH_ENVIRONMENT
-            .iter()
-            .chain(DEFENSIVE_2_1_226_AUTH_ENVIRONMENT)
-        {
+        for variable in [
+            "ANTHROPIC_FUTURE_PROVIDER",
+            "CLAUDE_CODE_FUTURE_TOKEN",
+            "CCR_FUTURE_TOKEN_FILE",
+            "AGENT_PROXY_FUTURE_TOKEN",
+        ] {
             assert_eq!(
                 environment.get(OsString::from(variable).as_os_str()),
                 Some(&None),
                 "{variable} was not removed"
             );
         }
+        assert!(!environment.contains_key(OsStr::new("AWS_PROFILE")));
     }
 
     #[test]
