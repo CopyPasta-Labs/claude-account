@@ -133,7 +133,7 @@ pub fn exec_active_profile(paths: &AppPaths, arguments: &[OsString]) -> Result<(
         )?;
         let _profile_reservation = ProfileReservation::acquire(paths, &expected_active)?;
         let _state_lock = StateLock::acquire(paths)?;
-        let state = state::load(paths)?;
+        let mut state = state::load(paths)?;
         if state.active.as_deref() != Some(expected_active.as_str()) {
             continue;
         }
@@ -141,27 +141,36 @@ pub fn exec_active_profile(paths: &AppPaths, arguments: &[OsString]) -> Result<(
         let profile = state
             .profiles
             .get(&expected_active)
+            .cloned()
             .with_context(|| format!("active profile `{expected_active}` does not exist"))?;
-        let configured_real_claude = state.real_claude.as_deref().context(
-            "The real Claude executable is not configured. Run `claude-account install`.",
+        let configured_real_claude = state.real_claude.clone();
+        let real_claude = resolve_real_claude(
+            configured_real_claude.as_deref(),
+            &current_executable,
+            paths,
         )?;
-        let real_claude =
-            pin_real_claude_candidate(configured_real_claude, &current_executable, paths)?;
-        validate_platform_support(&real_claude)?;
+        validate_platform_support(&real_claude.executable)?;
         if !is_recovery_auth_command(arguments) {
             let authentication_options = authentication_options(arguments)?;
             validate_profile_identity_with_options(
-                &real_claude,
-                profile,
+                &real_claude.executable,
+                &profile,
                 paths,
                 &authentication_options,
             )?;
         }
+        if real_claude.should_persist_launcher()
+            && configured_real_claude.as_deref() != Some(real_claude.launcher.as_path())
+        {
+            state.real_claude = Some(real_claude.launcher.clone());
+            state::save(paths, &state)?;
+        }
 
-        let mut command = managed_command(&real_claude, profile, paths)?;
+        let mut command = managed_command(&real_claude.executable, &profile, paths)?;
         command.args(arguments);
         let error = command.exec();
-        return Err(error).with_context(|| format!("failed to execute {}", real_claude.display()));
+        return Err(error)
+            .with_context(|| format!("failed to execute {}", real_claude.executable.display()));
     }
 }
 
@@ -613,22 +622,42 @@ fn parse_claude_version(value: &str) -> Option<ClaudeVersion> {
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealClaudeResolution {
+    pub launcher: PathBuf,
+    pub executable: PathBuf,
+    persist_launcher: bool,
+}
+
+impl RealClaudeResolution {
+    pub fn should_persist_launcher(&self) -> bool {
+        self.persist_launcher
+    }
+}
+
 pub fn resolve_real_claude(
     configured: Option<&Path>,
     current_executable: &Path,
     paths: &AppPaths,
-) -> Result<PathBuf> {
+) -> Result<RealClaudeResolution> {
     if let Some(explicit) = env::var_os("CLAUDE_ACCOUNT_REAL_CLAUDE") {
         let explicit = PathBuf::from(explicit);
         if !explicit.is_absolute() {
             bail!("CLAUDE_ACCOUNT_REAL_CLAUDE must contain an absolute path");
         }
-        return pin_real_claude_candidate(&explicit, current_executable, paths);
+        let mut resolved = pin_real_claude_candidate(&explicit, current_executable, paths)?;
+        resolved.persist_launcher = false;
+        return Ok(resolved);
     }
 
     if let Some(configured) = configured {
-        if let Ok(pinned) = pin_real_claude_candidate(configured, current_executable, paths) {
-            return Ok(pinned);
+        match pin_real_claude_candidate(configured, current_executable, paths) {
+            Ok(resolved) => return Ok(resolved),
+            Err(error) => {
+                if !configured.is_absolute() || !configured_candidate_is_missing(configured) {
+                    return Err(error);
+                }
+            }
         }
     }
 
@@ -645,14 +674,21 @@ pub fn resolve_real_claude(
         if candidate == paths.shim {
             continue;
         }
-        if let Ok(pinned) = pin_real_claude_candidate(&candidate, current_executable, paths) {
-            return Ok(pinned);
+        if let Ok(resolved) = pin_real_claude_candidate(&candidate, current_executable, paths) {
+            return Ok(resolved);
         }
     }
 
     bail!(
         "could not find the real `claude` executable; pass it with \
          `claude-account install --real /path/to/claude`"
+    )
+}
+
+fn configured_candidate_is_missing(candidate: &Path) -> bool {
+    matches!(
+        fs::metadata(candidate),
+        Err(error) if error.kind() == io::ErrorKind::NotFound
     )
 }
 
@@ -669,7 +705,13 @@ pub fn pin_real_claude_candidate(
     candidate: &Path,
     current_executable: &Path,
     paths: &AppPaths,
-) -> Result<PathBuf> {
+) -> Result<RealClaudeResolution> {
+    if !candidate.is_absolute() {
+        bail!(
+            "candidate must be an absolute path: {}",
+            candidate.display()
+        );
+    }
     validate_executable(candidate)?;
     let candidate_canonical = fs::canonicalize(candidate)
         .with_context(|| format!("failed to resolve {}", candidate.display()))?;
@@ -683,7 +725,11 @@ pub fn pin_real_claude_candidate(
             bail!("candidate points back to a managed claude-account path");
         }
     }
-    Ok(candidate_canonical)
+    Ok(RealClaudeResolution {
+        launcher: candidate.to_path_buf(),
+        executable: candidate_canonical,
+        persist_launcher: true,
+    })
 }
 
 #[cfg(test)]

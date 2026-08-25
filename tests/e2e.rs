@@ -42,6 +42,10 @@ fn run(program: &Path, account_home: &Path, home: &Path, arguments: &[&str]) -> 
 }
 
 fn write_fake_claude(path: &Path, calls: &Path) {
+    write_fake_claude_with_label(path, calls, "real");
+}
+
+fn write_fake_claude_with_label(path: &Path, calls: &Path, label: &str) {
     fs::write(
         path,
         format!(
@@ -87,9 +91,10 @@ fi
 if [ -n "$FORWARD_LOG" ]; then
   printf '%s\n' "$@" > "$FORWARD_LOG"
 fi
-printf 'forwarded:%s\n' "$*"
+printf 'forwarded:{}:%s\n' "$*"
 "#,
-            calls.display()
+            calls.display(),
+            label
         ),
     )
     .unwrap();
@@ -104,6 +109,134 @@ fn install(binary: &Path, fake_claude: &Path, account_home: &Path, home: &Path) 
         &["install", "--real", fake_claude.to_str().unwrap()],
     );
     account_home.join("bin/claude")
+}
+
+#[test]
+fn normal_launch_survives_claude_patch_update() {
+    let temp = tempfile::tempdir().unwrap();
+    let account_home = temp.path().join("account");
+    let home = temp.path().join("home");
+    let calls = temp.path().join("calls.log");
+    let official = temp.path().join("official");
+    let version_a = temp.path().join("claude-2.1.226-a");
+    let version_b = temp.path().join("claude-2.1.226-b");
+    let launcher = official.join("claude");
+    fs::create_dir(&home).unwrap();
+    fs::create_dir(&official).unwrap();
+    write_fake_claude_with_label(&version_a, &calls, "a");
+    write_fake_claude_with_label(&version_b, &calls, "b");
+    symlink(&version_a, &launcher).unwrap();
+    let binary = Path::new(env!("CARGO_BIN_EXE_claude-account"));
+    let shim = install(binary, &launcher, &account_home, &home);
+    run(
+        &shim,
+        &account_home,
+        &home,
+        &["account", "add", "work", "--email", "work@example.com"],
+    );
+
+    fs::remove_file(&launcher).unwrap();
+    symlink(&version_b, &launcher).unwrap();
+    fs::remove_file(&version_a).unwrap();
+    let output = run(&shim, &account_home, &home, &["normal-command"]);
+
+    assert!(String::from_utf8_lossy(&output.stdout).contains("forwarded:b:normal-command"));
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(account_home.join("state.json")).unwrap()).unwrap();
+    assert_eq!(state["real_claude"], launcher.to_str().unwrap());
+}
+
+#[test]
+fn missing_legacy_target_recovers_from_path_and_heals_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let account_home = temp.path().join("account");
+    let home = temp.path().join("home");
+    let calls = temp.path().join("calls.log");
+    let official = temp.path().join("official");
+    let version_a = temp.path().join("claude-2.1.226-a");
+    let version_b = temp.path().join("claude-2.1.226-b");
+    let launcher = official.join("claude");
+    fs::create_dir(&home).unwrap();
+    fs::create_dir(&official).unwrap();
+    write_fake_claude_with_label(&version_a, &calls, "a");
+    write_fake_claude_with_label(&version_b, &calls, "b");
+    symlink(&version_a, &launcher).unwrap();
+    let binary = Path::new(env!("CARGO_BIN_EXE_claude-account"));
+    let shim = install(binary, &launcher, &account_home, &home);
+    run(
+        &shim,
+        &account_home,
+        &home,
+        &["account", "add", "work", "--email", "work@example.com"],
+    );
+    let state_file = account_home.join("state.json");
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&fs::read(&state_file).unwrap()).unwrap();
+    state["real_claude"] = serde_json::Value::String(version_a.to_str().unwrap().to_owned());
+    fs::write(&state_file, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+    fs::remove_file(&version_a).unwrap();
+    fs::remove_file(&launcher).unwrap();
+    symlink(&version_b, &launcher).unwrap();
+    let inherited_path = std::env::var_os("PATH").unwrap_or_default();
+    let path = OsString::from(format!(
+        "{}:{}:{}",
+        account_home.join("bin").display(),
+        official.display(),
+        inherited_path.to_string_lossy()
+    ));
+
+    let output = invoke(
+        &shim,
+        &account_home,
+        &home,
+        &[OsStr::new("normal-command")],
+        &[("PATH", path.as_os_str())],
+    );
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("forwarded:b:normal-command"));
+    let healed: serde_json::Value =
+        serde_json::from_slice(&fs::read(account_home.join("state.json")).unwrap()).unwrap();
+    assert_eq!(healed["real_claude"], launcher.to_str().unwrap());
+}
+
+#[test]
+fn one_run_override_does_not_replace_stored_launcher() {
+    let temp = tempfile::tempdir().unwrap();
+    let account_home = temp.path().join("account");
+    let home = temp.path().join("home");
+    let calls = temp.path().join("calls.log");
+    let stored_launcher = temp.path().join("stored-claude");
+    let override_launcher = temp.path().join("override-claude");
+    fs::create_dir(&home).unwrap();
+    write_fake_claude_with_label(&stored_launcher, &calls, "stored");
+    write_fake_claude_with_label(&override_launcher, &calls, "override");
+    let binary = Path::new(env!("CARGO_BIN_EXE_claude-account"));
+    let shim = install(binary, &stored_launcher, &account_home, &home);
+    run(
+        &shim,
+        &account_home,
+        &home,
+        &["account", "add", "work", "--email", "work@example.com"],
+    );
+
+    let output = invoke(
+        &shim,
+        &account_home,
+        &home,
+        &[OsStr::new("normal-command")],
+        &[("CLAUDE_ACCOUNT_REAL_CLAUDE", override_launcher.as_os_str())],
+    );
+
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("forwarded:override:normal-command"));
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(account_home.join("state.json")).unwrap()).unwrap();
+    assert_eq!(state["real_claude"], stored_launcher.to_str().unwrap());
 }
 
 #[test]
@@ -144,9 +277,8 @@ fn isolated_profile_lifecycle_and_preflight() {
         &home,
         &["fix", "this", "--model", "sonnet"],
     );
-    assert!(
-        String::from_utf8_lossy(&forwarded.stdout).contains("forwarded:fix this --model sonnet")
-    );
+    assert!(String::from_utf8_lossy(&forwarded.stdout)
+        .contains("forwarded:real:fix this --model sonnet"));
 
     let state: serde_json::Value =
         serde_json::from_slice(&fs::read(account_home.join("state.json")).unwrap()).unwrap();
@@ -669,16 +801,20 @@ fn managed_roots_reject_symlink_targets() {
 }
 
 #[test]
-fn normal_launch_rejects_a_stored_executable_retargeted_to_the_shim() {
+fn stored_launcher_retargeted_to_shim_is_rejected() {
     let temp = tempfile::tempdir().unwrap();
     let account_home = temp.path().join("account");
     let home = temp.path().join("home");
+    let official = temp.path().join("official");
     let fake_claude = temp.path().join("real-claude");
+    let launcher = official.join("claude");
     let calls = temp.path().join("calls.log");
     fs::create_dir(&home).unwrap();
+    fs::create_dir(&official).unwrap();
     write_fake_claude(&fake_claude, &calls);
+    symlink(&fake_claude, &launcher).unwrap();
     let binary = Path::new(env!("CARGO_BIN_EXE_claude-account"));
-    let shim = install(binary, &fake_claude, &account_home, &home);
+    let shim = install(binary, &launcher, &account_home, &home);
     run(
         &shim,
         &account_home,
@@ -686,8 +822,8 @@ fn normal_launch_rejects_a_stored_executable_retargeted_to_the_shim() {
         &["account", "add", "work", "--email", "work@example.com"],
     );
 
-    fs::remove_file(&fake_claude).unwrap();
-    symlink(&shim, &fake_claude).unwrap();
+    fs::remove_file(&launcher).unwrap();
+    symlink(&shim, &launcher).unwrap();
     let output = invoke(
         &shim,
         &account_home,
